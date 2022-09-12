@@ -9,6 +9,7 @@ my $ip;
 my $ping_count = 0;
 my $interval = 1;
 my $raw_timestamps = 0;
+my $fix_icmp_timestamps = 0;
 for ($i = 0; $i < scalar(@ARGV); $i++) {
 	if ($i == scalar(@ARGV) - 1) {
 		if ($ARGV[$i] !~ /\d+\.\d+\.\d+\.\d+/) {
@@ -28,6 +29,8 @@ for ($i = 0; $i < scalar(@ARGV); $i++) {
 		$i++;
 	} elsif ($ARGV[$i] eq "-r") {
 		$raw_timestamps = 1;
+	} elsif ($ARGV[$i] eq "-f") {
+		$fix_icmp_timestamps = 1;
 	} else {
 		&usage();
 	}
@@ -38,6 +41,9 @@ if (scalar(@ARGV) == 0 || !defined($ip)) {
 }
 
 my $timeout = $interval;
+
+my $minimum_rtt;
+my $offset;
 
 my $packet_id = $$;
 my $seq;
@@ -56,13 +62,24 @@ while ($ping_count == 0 || $remaining > 0) {
 
 	my $rtt;
 	if (defined($orig) && defined($recv) && defined($tran) && defined($end)) {
+		if ($fix_icmp_timestamps) {
+			($orig, $recv, $tran, $end) = &correct_icmp_timestamps($orig, $recv, $tran, $end);
+		}
+		
 		# Calculate the one-way-delays and rtt
 		my $tx_time = $recv - $orig;
 		my $rx_time = $end - $tran;
 		$rtt = $end - $orig;
-
-		# Print the results
-		print("[" . &get_time() . "] target=$ip id=$id seq=$seq orig=$orig recv=$recv tran=$tran end=$end tx=$tx_time rx=$rx_time rtt=$rtt\n");
+		
+		print("[" . &get_time() . "] target=$ip id=$id seq=$seq orig=$orig recv=$recv tran=$tran end=$end tx=$tx_time rx=$rx_time rtt=$rtt");
+		
+		if ($fix_icmp_timestamps) {
+			print(" offset=$offset\n");
+		} else {
+			print("\n");
+		}
+		
+		
 	} else {
 		# Request timed out
 		print("[" . &get_time() . "] target=$ip id=$id seq=$seq TIMED OUT\n");
@@ -96,7 +113,8 @@ sub usage {
 	print("  <destination>      Hostname or IP address\n");
 	print("  -c <count>         Stop after <count> pings\n");
 	print("  -i <interval>      Seconds between ping requests\n");
-	print("  -r                 Print raw timestamps (seconds since the epoch)\n");
+	print("  -r                 Print raw log timestamps (seconds since the epoch)\n");
+	print("  -f                 Attempt to fix ICMP timestamps\n");
 	exit(1);
 }
 
@@ -266,4 +284,174 @@ sub get_time {
 	my $year = strftime("%Y", @localtime);
 	
 	return "$date_time.$millis $year";
+}
+
+sub update_icmp_offset {
+	my ($request_time, $response_time) = @_;
+
+	lock(%reflector_offsets);
+
+	my $minimum_half_rtt = int(&get_icmp_minimum_rtt($request_time + $response_time) / 2);
+
+	# First ping. Start with an offset of 0.
+	if (!defined($offset)) { $offset = 0; }
+	
+	# Adjust the offset if necessary
+	if ($request_time + $offset < $minimum_half_rtt) {
+		$offset = $minimum_half_rtt - $request_time;
+	} elsif ($response_time - $offset < $minimum_half_rtt) {
+		$offset = $response_time - $minimum_half_rtt;
+	}
+
+	return $offset;
+}
+
+sub get_icmp_minimum_rtt {
+	my ($new_sample) = @_;
+
+	if (!defined($minimum_rtt) || $new_sample < $minimum_rtt) {
+		$minimum_rtt = $new_sample;
+	}
+	
+	return $minimum_rtt;
+}
+
+# There are a variety of situations in which ICMP timestamps
+# can be inconsistent. This subroutine attempts to handle those
+# situations and correct the timestamps so we can calculate
+# accurate request and response times. The corrected timestamps
+# are returned in an array.
+sub correct_icmp_timestamps {
+	my ($icmp_orig, $icmp_recv, $icmp_tran, $icmp_end) = @_;
+
+	# Calculate request and response times based on the raw timestamps
+	my $ul_time = $icmp_recv - $icmp_orig;
+	my $dl_time = $icmp_end - $icmp_tran;
+	
+	# The offset attempts to compensate for a stable(ish)
+	# difference between the destination's timestamps and our
+	# timestamps.
+	if (!defined($offset)) {
+		# This must be the first ping.
+		# Calculate the offset based on the raw results.
+		&update_icmp_offset($ul_time, $dl_time);
+	}
+	
+	# Apply the current offset to the results
+	$ul_time += $offset;
+	$dl_time -= $offset;
+	
+	# Regardless of what the destination's timestamp is based on,
+	# both our timer and the destination's will be reset to zero at
+	# some point during the day, which will cause problems if
+	# our timer has been reset but the destination's hasn't, or
+	# vice versa. This is most likely to happen around midnight
+	# UTC, but could happen at any time if a destination's timer is
+	# relative to a time other than midnight UTC.
+	#
+	# There are four scenarios that need action:
+	#
+	# 1. Our timer has been reset to zero before the request was
+	#    sent, but the destination's hasn't
+	# 2. The destination's timer has been reset to zero before the
+	#    was received, but ours hasn't
+	# 3. Our timer resets to zero between sending the request
+	#    and receiving the response
+	# 4. The destination's timer resets to zero between receiving
+	#    the request and sending the response
+	#
+	# The following code checks whether there is a large disparity
+	# between this result and the previous result(s) for this
+	# destination. If there is a large disparity, it might be for one
+	# of the reasons listed above, in which case we can correct it
+	# by adding a day's worth of millseconds to the appropriate
+	# timestamps.
+	#
+	# If the result still looks weird after trying to correct for
+	# timer resets it means the destination is probably returning
+	# nonsensical timestamps (i.e. not based on a timer at all).
+
+	# First, check whether the request/response times look sensible
+	# after applying the current offset for this destination.
+	# If either of them is negative or greater than our ICMP timeout
+	# we might have a problem.
+	my $icmp_timeout_ms = $timeout * 1000;
+	if (
+		$ul_time < 0 || $ul_time > $icmp_timeout_ms ||
+		$dl_time < 0 || $dl_time > $icmp_timeout_ms
+	) {
+		# Record the pre-correction timestamps
+		my $icmp_orig_before = $icmp_orig;
+		my $icmp_recv_before = $icmp_recv;
+		my $icmp_tran_before = $icmp_tran;
+		my $icmp_end_before  = $icmp_end;
+
+		# The following code effectively checks whether the offset of the 
+		# destination's timestamps has changed by more than $icmp_timeout
+		# in either direction. This should only happen if the ICMP timestamps
+		# are excessively variable (i.e. nonsensical) or a timer reset has
+		# occurred as described above.
+
+		if ($icmp_recv + $offset + $icmp_timeout_ms < $icmp_orig) {
+			# The destination's timer might have been reset before it received
+			# the request, but ours was not
+			$icmp_recv += 86400000;
+			$icmp_tran += 86400000;
+		} elsif ($icmp_tran + $offset + $icmp_timeout_ms < $icmp_orig) {
+			# The destination's timer might have been reset before it sent the
+			# response, but ours was not
+			$icmp_tran += 86400000;
+		}
+			
+		if ($icmp_recv + $offset > $icmp_orig + $icmp_timeout_ms) {
+			# Our timer might have been reset before we sent the request,
+			# but the destination's wasn't
+			$icmp_orig += 86400000;
+			$icmp_end += 86400000;
+		} elsif ($icmp_tran + $offset > $icmp_end + $icmp_timeout_ms) {
+			# Our timer might have been reset before the destination sent the
+			# response, but the destination's wasn't
+			$icmp_end += 86400000;
+		}
+		
+		# If we tried to correct this result let's see if it worked.
+		# If we didn't attempt a correction (i.e. the disparity wasn't large enough)
+		# we'll just fall through and adjust the offset based on the new result.
+		if (
+			$icmp_orig_before != $icmp_orig ||
+			$icmp_recv_before != $icmp_recv ||
+			$icmp_tran_before != $icmp_tran ||
+			$icmp_end_before != $icmp_end
+		) {
+			# Recalculate the request/response times again and see if
+			# they look more sensible now.
+			$ul_time = $icmp_recv - $icmp_orig + $offset;
+			$dl_time = $icmp_end - $icmp_tran - $offset;
+			if (
+				$ul_time < 0 || $ul_time > $icmp_timeout_ms ||
+				$dl_time < 0 || $dl_time > $icmp_timeout_ms
+			) {
+				# The times still look weird. Nothing else we can try
+				# so just return the original results.
+				
+				# It's possible that the offset has changed legitimately, for example
+				# due a clock update either on our side or the destination's side.
+				# So we'll update the offset based on the current results (before we
+				# tried to correct them). If this was a legitimate offset change the
+				# results should be ok next time.
+				&update_icmp_offset(($icmp_recv_before - $icmp_orig_before), ($icmp_end_before - $icmp_tran_before));
+			
+				return ($icmp_orig_before, $icmp_recv_before, $icmp_tran_before, $icmp_end_before);
+			}
+		}
+	}
+	
+	# If we reach here the result is acceptable, either before or after correction.
+	
+	# Update the offset based on the (corrected) ICMP timestamps, and apply it
+	&update_icmp_offset(($icmp_recv - $icmp_orig), ($icmp_end - $icmp_tran));
+	$icmp_recv += $offset;
+	$icmp_tran += $offset;
+	
+	return ($icmp_orig, $icmp_recv, $icmp_tran, $icmp_end);
 }
