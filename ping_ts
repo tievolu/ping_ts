@@ -5,10 +5,6 @@ use POSIX qw(mktime);
 use Time::Local qw(timegm);
 use Socket qw(SOCK_RAW AF_INET inet_ntoa inet_aton sockaddr_in pack_sockaddr_in unpack_sockaddr_in);
 
-if (scalar(@ARGV) == 0) {
-	&usage();
-}
-
 my $ip;
 my $ping_count = 0;
 my $interval = 1;
@@ -29,6 +25,10 @@ for ($i = 0; $i < scalar(@ARGV); $i++) {
 	} else {
 		&usage();
 	}
+}
+
+if (scalar(@ARGV) == 0 || !defined($ip)) {
+        &usage();
 }
 
 my $timeout = $interval;
