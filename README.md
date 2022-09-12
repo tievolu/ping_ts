@@ -1,7 +1,7 @@
 # ping_ts
 Simple tool to send and receive timestamped pings (ICMP type 13), implemented in perl.
 
-Designed to work on OpenWrt.
+Designed to work on OpenWrt. May work on other platforms if the necessary perl modules are installed.
 
 To download:
 ```
