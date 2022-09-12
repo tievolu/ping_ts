@@ -22,6 +22,7 @@ Options
   <destination>      Hostname or IP address
   -c <count>         Stop after <count> pings
   -i <interval>      Seconds between ping requests
+  -r                 Print raw timestamps (seconds since the epoch)
 ```
 
 Example output:
