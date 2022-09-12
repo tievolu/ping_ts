@@ -66,3 +66,4 @@ Running with the `-f` option will attempt to "fix" the ICMP timestamps to produc
 ```
 offset  =  Continually updated and applied to ensure that tx and rx are never less than half the lowest recorded rtt
 ```
+The tool will also attempt to correct problems that occur when the local or destination timestamp counters get reset. This usually happens around midnight UTC, but if the destination's timer is based on something else it can happen at any time.
