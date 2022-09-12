@@ -1,6 +1,8 @@
 # ping_ts
 Simple tool to send and receive timestamped pings (ICMP type 13), implemented in perl.
 
+This tool can be used to measure upload and download latency separately.
+
 Designed to work on OpenWrt. May work on other platforms if the necessary perl modules are installed.
 
 ## Instructions
