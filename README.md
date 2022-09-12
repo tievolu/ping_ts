@@ -19,7 +19,7 @@ chmod 755 ping_ts
 
 ##### Install required modules:
 ```
-opkg update; opkg install perl perlbase-posix perlbase-filehandle perlbase-time
+opkg update; opkg install perl perlbase-filehandle perlbase-time
 ```
 
 ##### Usage
