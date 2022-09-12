@@ -20,10 +20,10 @@ for ($i = 0; $i < scalar(@ARGV); $i++) {
 		} else {
 			$ip = $ARGV[$i];
 		}
-	} elsif ($ARGV[$i] == "-c") {
+	} elsif ($ARGV[$i] eq "-c") {
 		$ping_count = $ARGV[$i+1];
 		$i++;
-	} elsif ($ARGV[$i] == "-i") { 
+	} elsif ($ARGV[$i] eq "-i") { 
 		$interval = $ARGV[$i+1];
 		$i++;
 	} else {
