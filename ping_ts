@@ -71,7 +71,7 @@ while ($ping_count == 0 || $remaining > 0) {
 		my $rx_time = $end - $tran;
 		$rtt = $end - $orig;
 		
-		print("[" . &get_time() . "] target=$ip id=$id seq=$seq orig=$orig recv=$recv tran=$tran end=$end tx=$tx_time rx=$rx_time rtt=$rtt");
+		print("[" . &get_time() . "] dest=$ip id=$id seq=$seq orig=$orig recv=$recv tran=$tran end=$end tx=$tx_time rx=$rx_time rtt=$rtt");
 		
 		if ($fix_icmp_timestamps) {
 			print(" offset=$offset\n");
