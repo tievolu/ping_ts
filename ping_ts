@@ -53,7 +53,7 @@ while ($ping_count == 0 || $remaining > 0) {
 		# Calculate the one-way-delays and rtt
 		my $tx_time = $recv - $orig;
 		my $rx_time = $end - $tran;
-		my $rtt = $end - $orig;
+		$rtt = $end - $orig;
 
 		# Print the results
 		print(localtime() . ": target=$ip id=$id seq=$seq orig=$orig recv=$recv tran=$tran end=$end tx=$tx_time rx=$rx_time rtt=$rtt\n");
@@ -68,7 +68,7 @@ while ($ping_count == 0 || $remaining > 0) {
 	}
 
 	if (($ping_count == 0 || $remaining > 0) && !$timed_out) {
-		select(undef, undef, undef, $interval - $rtt);
+		select(undef, undef, undef, $interval - ($rtt/1000));
 	}
 }
 
