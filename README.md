@@ -34,3 +34,16 @@ Example output:
 [Mon Sep 12 15:44:19.896 2022] target=151.101.128.81 id=13342 seq=4 orig=53059877 recv=53059882 tran=53059882 end=53059896 tx=5 rx=14 rtt=19
 [Mon Sep 12 15:44:20.898 2022] target=151.101.128.81 id=13342 seq=5 orig=53060878 recv=53060884 tran=53060884 end=53060898 tx=6 rx=14 rtt=20
 ```
+
+Definitions:
+```
+orig = time at which ICMP request was sent (milliseconds since midnight UTC)
+recv = time at which ICMP request was received (milliseconds since midnight UTC) [see note]
+tran = time at which ICMP response was sent (milliseconds since midnight UTC) [see note]
+end  = time at which ICMP response was sent (milliseconds since midnight UTC)
+tx   = recv - orig = request transit time i.e. upload latency (milliseconds) [see note]
+rx   = end - tran  = response transit time i.e. download latency (milliseconds) [see note]
+rtt  = end - orig  = round trip time (milliseconds)
+```
+**Note:**
+If the destination's clock is not _exactly_ synchronised to the local clock, or the destination's timestamps do not count from midnight UTC, these results will be misleading in absolute terms, but may still be useful in relative terms.
