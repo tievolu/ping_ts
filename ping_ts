@@ -82,7 +82,7 @@ while ($ping_count == 0 || $remaining > 0) {
 		
 	} else {
 		# Request timed out
-		print("[" . &get_time() . "] target=$ip id=$id seq=$seq TIMED OUT\n");
+		print("[" . &get_time() . "] dest=$ip id=$id seq=$seq TIMED OUT\n");
 		$timed_out = 1;
 	}
 
