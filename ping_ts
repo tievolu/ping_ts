@@ -1,0 +1,235 @@
+#!/usr/bin/perl
+
+use Time::HiRes qw(gettimeofday);
+use POSIX qw(mktime);
+use Time::Local qw(timegm);
+use Socket qw(SOCK_RAW AF_INET inet_ntoa inet_aton sockaddr_in pack_sockaddr_in unpack_sockaddr_in);
+
+if (scalar(@ARGV) == 0) {
+	&usage();
+}
+
+my $ip;
+my $ping_count = 0;
+my $interval = 1;
+for ($i = 0; $i < scalar(@ARGV); $i++) {
+	if ($i == scalar(@ARGV) - 1) {
+		if ($ARGV[$i] !~ /\d+\.\d+\.\d+\.\d+/) {
+			$ip = `nslookup $ARGV[$i] | grep "Address 1" | sed -e 's/Address 1: //g'`;
+			chomp($ip);
+		} else {
+			$ip = $ARGV[$i];
+		}
+	} elsif ($ARGV[$i] == "-c") {
+		$ping_count = $ARGV[$i+1];
+		$i++;
+	} elsif ($ARGV[$i] == "-i") { 
+		$interval = $ARGV[$i+1];
+		$i++;
+	} else {
+		&usage();
+	}
+}
+
+my $timeout = $interval;
+
+my $packet_id = $$;
+my $seq;
+
+# Create the socket
+my $fd = &create_icmp_socket();
+
+my $remaining = $ping_count;
+while ($ping_count == 0 || $remaining > 0) {
+	# Send an ICMP timestamp request
+	my ($id, $seq) = &send_icmp_timestamp_request($ip, $fd);
+
+	# Wait for the ICMP timestamp response
+	my $timed_out = 0;
+	my ($orig, $recv, $tran, $end) = &receive_icmp_timestamp_response($id, $seq, $timeout);
+
+	my $rtt;
+	if (defined($orig) && defined($recv) && defined($tran) && defined($end)) {
+		# Calculate the one-way-delays and rtt
+		my $tx_time = $recv - $orig;
+		my $rx_time = $end - $tran;
+		my $rtt = $end - $orig;
+
+		# Print the results
+		print(localtime() . ": target=$ip id=$id seq=$seq orig=$orig recv=$recv tran=$tran end=$end tx=$tx_time rx=$rx_time rtt=$rtt\n");
+	} else {
+		# Request timed out
+		print(localtime() . ": target=$ip id=$id seq=$seq TIMED OUT\n");
+		$timed_out = 1;
+	}
+
+	if ($ping_count > 0) {
+		$remaining--;
+	}
+
+	if (($ping_count == 0 || $remaining > 0) && !$timed_out) {
+		select(undef, undef, undef, $interval - $rtt);
+	}
+}
+
+
+##################################################################################
+# Subroutines
+##################################################################################
+
+use constant ICMP_PROTOCOL         => 1;
+use constant ICMP_TIMESTAMP        => 13;
+use constant ICMP_TIMESTAMP_REPLY  => 14;
+use constant ICMP_TIMESTAMP_STRUCT => "C2 n3 N3"; # Structure of a ICMP timestamp packet
+
+sub usage {
+	print("Usage\n");
+	print("  ping_ts [options] <destination>\n");
+	print("\n");
+	print("Options\n");
+	print("  <destination>      Hostname or IP address\n");
+	print("  -c <count>         Stop after <count> pings\n");
+	print("  -i <interval>      Seconds between ping requests\n");
+	exit(1);
+}
+
+# Create a new ICMP socket
+# Returns the file descriptor
+sub create_icmp_socket {
+	my $fd;
+	socket($fd, AF_INET, SOCK_RAW, ICMP_PROTOCOL) || die("ICMP socket error - $!");
+	return $fd;
+}
+
+# Update the sequence number
+sub update_seq {
+	if (defined($seq)) {
+		$seq = ($seq + 1) % 65536;
+	} else {
+		$seq = 1
+	}
+}
+
+# Get the number of milliseconds since midnight
+sub get_ms_since_midnight {
+	# Get the number of milliseconds since midnight UTC
+
+	# Today's date in UTC
+	my ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday) = gmtime();
+
+	# Epoch time for 00:00 this morning (UTC)
+	$midnight_utc_ms = timegm(0, 0, 0, $mday, $mon, $year) * 1000;
+
+	# Return the difference between the two
+	return &round(gettimeofday() * 1000) - $midnight_utc_ms;
+}
+
+# Send an ICMP timestamp request tp the specified IP address, on the specified socket
+# Returns the packet ID and sequence number for the message that was sent
+sub send_icmp_timestamp_request {
+	my ($ip, $fd) = @_;
+
+	# Update the sequence number
+	&update_seq();
+
+	# Get the number of milliseconds since midnight UTC
+	my $ms_since_midnight = &get_ms_since_midnight();
+
+	# Construct the ICMP message
+	my $msg = pack(ICMP_TIMESTAMP_STRUCT, ICMP_TIMESTAMP, 0, 0, $packet_id, $seq, $ms_since_midnight, 0, 0);
+
+	# Calculate the checksum
+	my $checksum = &get_checksum($msg);
+
+	# Add the checksum to the message
+	$msg = pack(ICMP_TIMESTAMP_STRUCT, ICMP_TIMESTAMP, 0, $checksum, $packet_id, $seq, $ms_since_midnight, 0, 0);
+
+	# Send the message
+	send($fd, $msg, 0, pack_sockaddr_in(0, inet_aton($ip)));
+
+	# Return the ID and sequence number
+	return ($packet_id, $seq);
+}
+
+# Subroutine to calculate an internet checksum (taken from Net::Ping.pm)
+sub get_checksum {
+	my ($msg) = @_;
+
+	my $len_msg = length($msg);
+	my $num_short = int($len_msg / 2);
+	my $chk = 0;
+  
+	foreach $short (unpack("n$num_short", $msg)) {
+		$chk += $short;
+	}
+	
+	# Add the odd byte in
+	$chk += (unpack("C", substr($msg, $len_msg - 1, 1)) << 8) if $len_msg % 2;
+
+	$chk = ($chk >> 16) + ($chk & 0xffff);      # Fold high into low
+
+	return(~(($chk >> 16) + $chk) & 0xffff);    # Again and complement
+}
+
+# Wait up to the specified timeout for an ICMP timestamp response corresponding
+# to the specified packet ID and sequence number.
+sub receive_icmp_timestamp_response {
+	my ($id, $seq, $timeout) = @_;
+
+	# Calculate our maximum finish time based on the specified timeout
+	my $finish_time = gettimeofday() + $timeout;
+
+	my $rin = "";
+	vec($rin, $fd->fileno(), 1) = 1;
+	my $done = 0;
+	while (!$done && $timeout > 0) {
+		# Block and wait for a packet
+		my $nfound = select((my $rout = $rin), undef, undef, $timeout);
+
+		my $end_ts = &get_ms_since_midnight();
+
+		# Calculate the time we have left
+		$timeout = $finish_time - gettimeofday();
+
+		if ($nfound != -1) {
+			# Receive the packet and get the IP (port will always be zero)
+			my $recv_msg;
+			my ($from_port, $from_ip) = unpack_sockaddr_in(recv($fd, $recv_msg, 1500, 0));
+
+			# Get the payload from the packet
+			my $pl_offset = 20;
+			my ($reply_type, $reply_subcode) = unpack("C2", substr($recv_msg, $pl_offset, 2));
+
+			# Check whether this is the timestamp reply that we're looking for
+			my $reply_id = -1;
+			my $reply_seq = -1;
+			my $orig_ts = -1;
+			my $recv_ts = -1;
+			my $tran_ts = -1;
+			if ($reply_type == ICMP_TIMESTAMP_REPLY) {
+				if (length($recv_msg) >= $pl_offset + 20) {
+					($reply_id, $reply_seq, $orig_ts, $recv_ts, $tran_ts) = unpack("n2 N3", substr($recv_msg, $pl_offset + 4, 16));
+				}
+			}
+
+			if ($reply_id == $id && $reply_seq == $seq) {
+				return ($orig_ts, $recv_ts, $tran_ts, $end_ts);
+			} else {
+				next;
+			}
+		}
+
+		# Timed out
+		$done = 1;
+	}
+
+	# If we reach here we didn't receive a response
+	return ();
+}
+
+# Round to the nearest integer
+sub round {
+        my ($value) = @_;
+
+        return int($value + 0.5);
+}
