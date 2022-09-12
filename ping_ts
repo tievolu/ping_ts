@@ -1,18 +1,22 @@
 #!/usr/bin/perl
 
 use Time::HiRes qw(gettimeofday);
-use POSIX qw(mktime);
+use POSIX qw(mktime strftime);
 use Time::Local qw(timegm);
 use Socket qw(SOCK_RAW AF_INET inet_ntoa inet_aton sockaddr_in pack_sockaddr_in unpack_sockaddr_in);
 
 my $ip;
 my $ping_count = 0;
 my $interval = 1;
+my $raw_timestamps = 0;
 for ($i = 0; $i < scalar(@ARGV); $i++) {
 	if ($i == scalar(@ARGV) - 1) {
 		if ($ARGV[$i] !~ /\d+\.\d+\.\d+\.\d+/) {
-			$ip = `nslookup $ARGV[$i] | grep "Address 1" | sed -e 's/Address 1: //g'`;
+			$ip = `nslookup $ARGV[$i] 2>&1 | grep "Address 1" | sed -e 's/Address 1: //g'`;
 			chomp($ip);
+			if ($ip !~ /\d+\.\d+\.\d+\.\d+/) {
+				die("Failed to resolve hostname \"$ARGV[$i]\"\n");
+			}
 		} else {
 			$ip = $ARGV[$i];
 		}
@@ -22,6 +26,8 @@ for ($i = 0; $i < scalar(@ARGV); $i++) {
 	} elsif ($ARGV[$i] eq "-i") { 
 		$interval = $ARGV[$i+1];
 		$i++;
+	} elsif ($ARGV[$i] eq "-r") {
+		$raw_timestamps = 1;
 	} else {
 		&usage();
 	}
@@ -56,10 +62,10 @@ while ($ping_count == 0 || $remaining > 0) {
 		$rtt = $end - $orig;
 
 		# Print the results
-		print(localtime() . ": target=$ip id=$id seq=$seq orig=$orig recv=$recv tran=$tran end=$end tx=$tx_time rx=$rx_time rtt=$rtt\n");
+		print("[" . &get_time() . "] target=$ip id=$id seq=$seq orig=$orig recv=$recv tran=$tran end=$end tx=$tx_time rx=$rx_time rtt=$rtt\n");
 	} else {
 		# Request timed out
-		print(localtime() . ": target=$ip id=$id seq=$seq TIMED OUT\n");
+		print("[" . &get_time() . "] target=$ip id=$id seq=$seq TIMED OUT\n");
 		$timed_out = 1;
 	}
 
@@ -90,6 +96,7 @@ sub usage {
 	print("  <destination>      Hostname or IP address\n");
 	print("  -c <count>         Stop after <count> pings\n");
 	print("  -i <interval>      Seconds between ping requests\n");
+	print("  -r                 Print raw timestamps (seconds since the epoch)\n");
 	exit(1);
 }
 
@@ -232,4 +239,31 @@ sub round {
         my ($value) = @_;
 
         return int($value + 0.5);
+}
+
+# Get a formatted localtime string for the current time,
+# including milliseconds. Do our own rounding to avoid
+# sprintf()'s banker's rounding.
+sub get_time {
+	my $time = scalar(gettimeofday());
+
+	my $secs = int($time);
+	my $millis = &round(($time - $secs) * 1000);
+
+	if ($millis == 1000) {
+	        $secs += 1;
+	        $millis = 0;
+	}
+
+	$millis = sprintf("%03d", $millis);
+
+	if ($raw_timestamps) {
+		return "$secs.$millis";
+	}
+
+	my @localtime = localtime($secs);
+	my $date_time = strftime("%a %b %e %H:%M:%S", @localtime);
+	my $year = strftime("%Y", @localtime);
+	
+	return "$date_time.$millis $year";
 }
