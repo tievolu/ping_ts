@@ -12,6 +12,11 @@ Designed to work on OpenWrt. May work on other platforms if the necessary perl m
 wget https://raw.githubusercontent.com/tievolu/ping_ts/main/ping_ts
 ```
 
+##### Set execute permission
+```
+chmod 755 ping_ts
+```
+
 ##### Install required modules:
 ```
 opkg update; opkg install perl perlbase-posix perlbase-socket perlbase-time
