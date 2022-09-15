@@ -1,46 +1,42 @@
 #!/usr/bin/perl
 
+use strict;
+use warnings;
+
+use threads;
+use threads::shared;
+use threads 'exit' => 'threads_only';
 use Time::HiRes qw(gettimeofday);
 use POSIX qw(mktime strftime);
 use Time::Local qw(timegm);
 use Socket qw(SOCK_RAW AF_INET inet_ntoa inet_aton sockaddr_in pack_sockaddr_in unpack_sockaddr_in);
 
+# Shared variables
+my %icmp_timeout_times        :shared;    # Times at which pending ICMP requests will time out
+my $ping_requests_sent        :shared;    # Number of ping requests sent
+my $ping_responses_received   :shared;    # Number of ping responses received
+my $ping_requests_timed_out   :shared;    # Number of ping requests that have timed out
+
+$ping_requests_sent = 0;
+$ping_responses_received = 0;
+$ping_requests_timed_out = 0;
+
 my $ip;
 my $ping_count = 0;
 my $interval = 1;
-my $raw_timestamps = 0;
-my $fix_icmp_timestamps = 0;
-for ($i = 0; $i < scalar(@ARGV); $i++) {
-	if ($i == scalar(@ARGV) - 1) {
-		if ($ARGV[$i] !~ /\d+\.\d+\.\d+\.\d+/) {
-			$ip = `nslookup $ARGV[$i] 2>&1 | grep "Address 1" | sed -e 's/Address 1: //g'`;
-			chomp($ip);
-			if ($ip !~ /\d+\.\d+\.\d+\.\d+/) {
-				die("Failed to resolve hostname \"$ARGV[$i]\"\n");
-			}
-		} else {
-			$ip = $ARGV[$i];
-		}
-	} elsif ($ARGV[$i] eq "-c") {
-		$ping_count = $ARGV[$i+1];
-		$i++;
-	} elsif ($ARGV[$i] eq "-i") { 
-		$interval = $ARGV[$i+1];
-		$i++;
-	} elsif ($ARGV[$i] eq "-r") {
-		$raw_timestamps = 1;
-	} elsif ($ARGV[$i] eq "-f") {
-		$fix_icmp_timestamps = 1;
-	} else {
-		&usage();
-	}
-}
+my $timeout = 2;
+my $unix_timestamps = 0;
+my $fix_icmp_timestamps = 1;
 
-if (scalar(@ARGV) == 0 || !defined($ip)) {
-        &usage();
-}
-
-my $timeout = $interval;
+my $latency_rtt_min   = $timeout;
+my $latency_rtt_max   = 0;
+my $latency_rtt_total = 0;;
+my $latency_ul_min    = $timeout;
+my $latency_ul_max    = 0;
+my $latency_ul_total  = 0;
+my $latency_dl_min    = $timeout;
+my $latency_dl_max    = 0;
+my $latency_dl_total  = 0;
 
 my $minimum_rtt;
 my $offset;
@@ -48,53 +44,26 @@ my $offset;
 my $packet_id = $$;
 my $seq;
 
+&process_args();
+
+if (scalar(@ARGV) == 0 || !defined($ip)) {
+	&usage();
+}
+
 # Create the socket
 my $fd = &create_icmp_socket();
 
-my $remaining = $ping_count;
-while ($ping_count == 0 || $remaining > 0) {
-	# Send an ICMP timestamp request
-	my ($id, $seq) = &send_icmp_timestamp_request($ip, $fd);
+# Start the ICMP sender thread
+my $sender_thread = &create_sender_thread($interval, $fd, $ping_count);
 
-	# Wait for the ICMP timestamp response
-	my $timed_out = 0;
-	my ($orig, $recv, $tran, $end) = &receive_icmp_timestamp_response($id, $seq, $timeout);
+# Define signal handlers
+$SIG{INT} = \&signal_handler;
+$SIG{TERM} = \&signal_handler;
 
-	my $rtt;
-	if (defined($orig) && defined($recv) && defined($tran) && defined($end)) {
-		if ($fix_icmp_timestamps) {
-			($orig, $recv, $tran, $end) = &correct_icmp_timestamps($orig, $recv, $tran, $end);
-		}
-		
-		# Calculate the one-way-delays and rtt
-		my $tx_time = $recv - $orig;
-		my $rx_time = $end - $tran;
-		$rtt = $end - $orig;
-		
-		print("[" . &get_time() . "] dest=$ip id=$id seq=$seq orig=$orig recv=$recv tran=$tran end=$end tx=$tx_time rx=$rx_time rtt=$rtt");
-		
-		if ($fix_icmp_timestamps) {
-			print(" offset=$offset\n");
-		} else {
-			print("\n");
-		}
-		
-		
-	} else {
-		# Request timed out
-		print("[" . &get_time() . "] dest=$ip id=$id seq=$seq TIMED OUT\n");
-		$timed_out = 1;
-	}
+# Wait for ICMP responses and process them
+&receive_icmp_timestamp_responses($fd);
 
-	if ($ping_count > 0) {
-		$remaining--;
-	}
-
-	if (($ping_count == 0 || $remaining > 0) && !$timed_out) {
-		select(undef, undef, undef, $interval - ($rtt/1000));
-	}
-}
-
+&finish();
 
 ##################################################################################
 # Subroutines
@@ -104,6 +73,7 @@ use constant ICMP_PROTOCOL         => 1;
 use constant ICMP_TIMESTAMP        => 13;
 use constant ICMP_TIMESTAMP_REPLY  => 14;
 use constant ICMP_TIMESTAMP_STRUCT => "C2 n3 N3"; # Structure of a ICMP timestamp packet
+use constant ICMP_PAYLOAD_OFFSET   => 20;
 
 sub usage {
 	print("Usage\n");
@@ -113,9 +83,116 @@ sub usage {
 	print("  <destination>      Hostname or IP address\n");
 	print("  -c <count>         Stop after <count> pings\n");
 	print("  -i <interval>      Seconds between ping requests\n");
-	print("  -r                 Print raw log timestamps (seconds since the epoch)\n");
-	print("  -f                 Attempt to fix ICMP timestamps\n");
+	print("  -t <timeout>       Seconds to wait for each response\n");
+	print("  -r                 Use raw ICMP timestamp values - do not attempt to correct them\n");
+	print("  -u                 Print log timestamps in unix time (seconds since the epoch)\n");
 	exit(1);
+}
+
+sub process_args {
+	for (my $i = 0; $i < scalar(@ARGV); $i++) {
+		if ($i == scalar(@ARGV) - 1) {
+			if ($ARGV[$i] !~ /\d+\.\d+\.\d+\.\d+/) {
+				$ip = `nslookup $ARGV[$i] 2>&1 | grep "Address 1" | sed -e 's/Address 1: //g'`;
+				chomp($ip);
+				if ($ip !~ /\d+\.\d+\.\d+\.\d+/) {
+					die("Failed to resolve hostname \"$ARGV[$i]\"\n");
+				}
+			} else {
+				$ip = $ARGV[$i];
+			}
+		} elsif ($ARGV[$i] eq "-c") {
+			$ping_count = $ARGV[$i+1];
+			$i++;
+		} elsif ($ARGV[$i] eq "-i") { 
+			$interval = $ARGV[$i+1];
+			$i++;
+		} elsif ($ARGV[$i] eq "-t") {
+			$timeout = $ARGV[$i+1];
+			$i++;
+		} elsif ($ARGV[$i] eq "-u") {
+			$unix_timestamps = 1;
+		} elsif ($ARGV[$i] eq "-x") {
+			$fix_icmp_timestamps = 0;
+		} else {
+			&usage();
+		}
+	}	
+}
+
+sub signal_handler {
+	# Kill the sender thread to prevent it writing any more output
+	$sender_thread->kill("KILL")->detach();
+	&finish();
+}
+
+# Print stats
+sub finish {
+	# If we haven't detached from the sender thread, wait for it to finish
+	if (!$sender_thread->is_detached()) {
+		$sender_thread->join();
+	}
+	
+	my $packet_loss_pc = sprintf("%d", (($ping_requests_sent - $ping_responses_received) / $ping_requests_sent) * 100);
+	print("\n--- $ip timestamped ping statistics ---\n");
+	print("$ping_requests_sent packets transmitted, $ping_responses_received packets received, $packet_loss_pc% packet loss\n");
+
+	if ($ping_responses_received > 0) {
+		printf("Round-trip    min/avg/max = %d/%.3f/%d ms\n", $latency_rtt_min, $latency_rtt_total/$ping_responses_received, $latency_rtt_max);
+		printf("Request  (TX) min/avg/max = %d/%.3f/%d ms\n", $latency_ul_min, $latency_ul_total/$ping_responses_received, $latency_ul_max);
+		printf("Response (RX) min/avg/max = %d/%.3f/%d ms\n", $latency_dl_min, $latency_dl_total/$ping_responses_received, $latency_dl_max);
+	}
+	
+	exit();
+}
+
+# Thread to send ICMP timestamp requests
+sub create_sender_thread {
+	my ($icmp_interval, $fd, $ping_count) = @_;
+
+	return threads->create(sub {
+		local $SIG{KILL} = sub { threads->exit() };
+		
+		my $thr_id = threads->self->tid;
+		
+		my @reflector_ips;
+
+		while ($ping_count == 0 || ($ping_responses_received + $ping_requests_timed_out) < $ping_count) {
+			# Go through the requests hash and record/clear any requests that have timed out
+			# We need to do this here (i.e. instead of on the main thread) to ensure that
+			# requests time out promptly  when the connection is in a really bad way or
+			# completely down. Under normal circumstances this operation is very cheap
+			# because there will be a very small number of pending requests, if not none.
+			&process_icmp_timeouts();
+
+			if ($ping_count == 0 || $ping_requests_sent < $ping_count) {
+				# Get the current time
+				my $current_time = gettimeofday();					
+								
+				# Send an ICMP timestamp request
+				my ($id, $seq) = &send_icmp_timestamp_request($ip, $fd);
+
+				# Note: we don't need to lock $ping_requests_sent here because only the
+				# sender thread ever modifies it
+				$ping_requests_sent++;
+				
+				{
+					# Calculate and store the time at which this request will timeout
+					lock(%icmp_timeout_times);
+					my $request_sig = "$ip $id $seq";
+					$icmp_timeout_times{$request_sig} = $current_time + $timeout;
+				}
+				
+				if (($ping_count == 0 || $ping_requests_sent < $ping_count)) {
+					select(undef, undef, undef, $icmp_interval);
+				}
+			} elsif (($ping_responses_received + $ping_requests_timed_out) < $ping_requests_sent) {
+				# All pings have been sent, but we haven't accounted for them all yet.
+				# Sleep for 50ms before checking for timeouts again.
+				select(undef, undef, undef, 0.05);
+			}
+		}
+	});
 }
 
 # Create a new ICMP socket
@@ -137,19 +214,17 @@ sub update_seq {
 
 # Get the number of milliseconds since midnight
 sub get_ms_since_midnight {
-	# Get the number of milliseconds since midnight UTC
-
 	# Today's date in UTC
 	my ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday) = gmtime();
 
 	# Epoch time for 00:00 this morning (UTC)
-	$midnight_utc_ms = timegm(0, 0, 0, $mday, $mon, $year) * 1000;
+	my $midnight_utc_ms = timegm(0, 0, 0, $mday, $mon, $year) * 1000;
 
 	# Return the difference between the two
 	return &round(gettimeofday() * 1000) - $midnight_utc_ms;
 }
 
-# Send an ICMP timestamp request tp the specified IP address, on the specified socket
+# Send an ICMP timestamp request to the specified IP address, on the specified socket
 # Returns the packet ID and sequence number for the message that was sent
 sub send_icmp_timestamp_request {
 	my ($ip, $fd) = @_;
@@ -184,7 +259,7 @@ sub get_checksum {
 	my $num_short = int($len_msg / 2);
 	my $chk = 0;
   
-	foreach $short (unpack("n$num_short", $msg)) {
+	foreach my $short (unpack("n$num_short", $msg)) {
 		$chk += $short;
 	}
 	
@@ -196,60 +271,140 @@ sub get_checksum {
 	return(~(($chk >> 16) + $chk) & 0xffff);    # Again and complement
 }
 
-# Wait up to the specified timeout for an ICMP timestamp response corresponding
-# to the specified packet ID and sequence number.
-sub receive_icmp_timestamp_response {
-	my ($id, $seq, $timeout) = @_;
+# Go through the requests hash and clear any requests that have timed out
+sub process_icmp_timeouts {
+	lock(%icmp_timeout_times);
+	
+	foreach my $request_sig (keys(%icmp_timeout_times)) {
+		my $current_time = gettimeofday();
+		if ($icmp_timeout_times{$request_sig} <= $current_time) {
+			my ($request_ip, $request_id, $request_seq) = split(/ /, $request_sig);
 
-	# Calculate our maximum finish time based on the specified timeout
-	my $finish_time = gettimeofday() + $timeout;
+			# Print result
+			print("[" . &get_time() . "] dest=$request_ip id=$request_id seq=$request_seq TIMED OUT\n");
+			
+			# Note: we don't need to lock $ping_requests_timed_out here because only the
+			# sender thread ever modifies it
+			$ping_requests_timed_out++;
+						
+			# Remove this request from our list of pending requests
+			delete($icmp_timeout_times{$request_sig});
+		}
+	}
+}
 
+# Wait for ICMP timestamp responses and handle them
+sub receive_icmp_timestamp_responses {
+	my ($fd) = @_;
+	
 	my $rin = "";
 	vec($rin, $fd->fileno(), 1) = 1;
-	my $done = 0;
-	while (!$done && $timeout > 0) {
-		# Block and wait for a packet
-		my $nfound = select((my $rout = $rin), undef, undef, $timeout);
-
-		my $end_ts = &get_ms_since_midnight();
-
-		# Calculate the time we have left
-		$timeout = $finish_time - gettimeofday();
-
+	while ($ping_count == 0 || ($ping_responses_received + $ping_requests_timed_out) < $ping_count) {
+		# Block and wait for a packet to arrive
+		my $nfound = select((my $rout = $rin), undef, undef, 0);	
+			
 		if ($nfound != -1) {
-			# Receive the packet and get the IP (port will always be zero)
+			# Receive the packet and get the packed address.
 			my $recv_msg;
-			my ($from_port, $from_ip) = unpack_sockaddr_in(recv($fd, $recv_msg, 1500, 0));
+			my $packed_addr = recv($fd, $recv_msg, 1500, 0);
 
-			# Get the payload from the packet
-			my $pl_offset = 20;
-			my ($reply_type, $reply_subcode) = unpack("C2", substr($recv_msg, $pl_offset, 2));
+			if (defined($packed_addr)) {				
+				# Unpack the socket address info (port will always be zero)
+				my ($from_port, $from_ip) = unpack_sockaddr_in($packed_addr);
+								
+				# Get the ICMP type from the packet
+				my $reply_type = unpack("C", substr($recv_msg, ICMP_PAYLOAD_OFFSET, 1));
 
-			# Check whether this is the timestamp reply that we're looking for
-			my $reply_id = -1;
-			my $reply_seq = -1;
-			my $orig_ts = -1;
-			my $recv_ts = -1;
-			my $tran_ts = -1;
-			if ($reply_type == ICMP_TIMESTAMP_REPLY) {
-				if (length($recv_msg) >= $pl_offset + 20) {
-					($reply_id, $reply_seq, $orig_ts, $recv_ts, $tran_ts) = unpack("n2 N3", substr($recv_msg, $pl_offset + 4, 16));
+				# If this is a timestamp reply, handle it
+				if ($reply_type == ICMP_TIMESTAMP_REPLY) {
+					&handle_icmp_reply(inet_ntoa($from_ip), $recv_msg);
 				}
 			}
-
-			if ($reply_id == $id && $reply_seq == $seq) {
-				return ($orig_ts, $recv_ts, $tran_ts, $end_ts);
-			} else {
-				next;
-			}
 		}
+	}
+}
 
-		# Timed out
-		$done = 1;
+# Handle an ICMP timestamp reply packet
+sub handle_icmp_reply {
+	my ($from_ip, $recv_msg) = @_;
+
+	# Get the current timestamp
+	my $end = &get_ms_since_midnight();
+
+	# This will be populated from the data stored by the sender thread
+	my $icmp_sent;
+
+	my $reply_received = 0;
+	my $reply_id = -1;
+	my $reply_seq = -1;
+	my $orig = -1;
+	my $recv = -1;
+	my $tran = -1;
+	
+	if (length($recv_msg) < ICMP_PAYLOAD_OFFSET + 20) {
+		# Not a valid timestamp reply packet.
+		return;
 	}
 
-	# If we reach here we didn't receive a response
-	return ();
+	($reply_id, $reply_seq, $orig, $recv, $tran) = unpack("n2 N3", substr($recv_msg, ICMP_PAYLOAD_OFFSET + 4, 16));
+
+	my $reply_sig = "$from_ip $reply_id $reply_seq";
+
+	{
+		lock(%icmp_timeout_times);
+		
+		# Check whether this ICMP reply corresponds to one of our requests
+		if (exists($icmp_timeout_times{$reply_sig})) {
+			# Remove this request from our list of pending requests
+			delete($icmp_timeout_times{$reply_sig});
+						
+			# We'll continue processing later on to avoid holding the hash locks for longer than necessary
+			$reply_received = 1;
+		}
+	} 
+
+	if ($reply_received) {
+		if ($fix_icmp_timestamps) {
+			($orig, $recv, $tran, $end) = &correct_icmp_timestamps($orig, $recv, $tran, $end);
+		}
+		
+		# Calculate the one-way-delays and rtt
+		my $tx_time = $recv - $orig;
+		my $rx_time = $end - $tran;
+		my $rtt = $end - $orig;
+		
+		print("[" . &get_time() . "] dest=$ip id=$reply_id seq=$reply_seq orig=$orig recv=$recv tran=$tran end=$end tx=$tx_time rx=$rx_time rtt=$rtt");
+		
+		if ($fix_icmp_timestamps) {
+			print(" offset=$offset\n");
+		} else {
+			print("\n");
+		}
+		
+		$ping_responses_received++;
+		
+		&update_stats($rtt, $tx_time, $rx_time);
+	}
+}
+
+# Upload the latency stats.
+sub update_stats {
+	my ($rtt, $ul, $dl) = @_;
+	
+	# Maxima and minima
+	if ($rtt < $latency_rtt_min) { $latency_rtt_min = $rtt; }
+	if ($rtt > $latency_rtt_max) { $latency_rtt_max = $rtt; }
+	
+	if ($ul  < $latency_ul_min)  { $latency_ul_min  = $ul;  }
+	if ($ul  > $latency_ul_max)  { $latency_ul_max  = $ul;  }
+	
+	if ($dl  < $latency_dl_min)  { $latency_dl_min  = $dl;  }
+	if ($dl  > $latency_dl_max)  { $latency_dl_max  = $dl;  }
+	
+	# Totals, for calculating averages at the end
+	$latency_rtt_total += $rtt;
+	$latency_ul_total  += $ul;
+	$latency_dl_total  += $dl;
 }
 
 # Round to the nearest integer
@@ -275,7 +430,7 @@ sub get_time {
 
 	$millis = sprintf("%03d", $millis);
 
-	if ($raw_timestamps) {
+	if ($unix_timestamps) {
 		return "$secs.$millis";
 	}
 
@@ -288,8 +443,6 @@ sub get_time {
 
 sub update_icmp_offset {
 	my ($request_time, $response_time) = @_;
-
-	lock(%reflector_offsets);
 
 	my $minimum_half_rtt = int(&get_icmp_minimum_rtt($request_time + $response_time) / 2);
 
