@@ -112,7 +112,7 @@ sub process_args {
 			$i++;
 		} elsif ($ARGV[$i] eq "-u") {
 			$unix_timestamps = 1;
-		} elsif ($ARGV[$i] eq "-x") {
+		} elsif ($ARGV[$i] eq "-r") {
 			$fix_icmp_timestamps = 0;
 		} else {
 			&usage();
