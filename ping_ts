@@ -23,18 +23,18 @@ $ping_requests_timed_out = 0;
 
 my $ip;
 my $ping_count = 0;
-my $interval = 1;
-my $timeout = 2;
+my $interval = 1;  # seconds
+my $timeout = 2;   # seconds
 my $unix_timestamps = 0;
 my $fix_icmp_timestamps = 1;
 
-my $latency_rtt_min   = $timeout;
+my $latency_rtt_min   = $timeout * 1000;  # ms
 my $latency_rtt_max   = 0;
-my $latency_rtt_total = 0;;
-my $latency_ul_min    = $timeout;
+my $latency_rtt_total = 0;
+my $latency_ul_min    = $timeout * 1000;  # ms
 my $latency_ul_max    = 0;
 my $latency_ul_total  = 0;
-my $latency_dl_min    = $timeout;
+my $latency_dl_min    = $timeout * 1000;  # ms
 my $latency_dl_max    = 0;
 my $latency_dl_total  = 0;
 
