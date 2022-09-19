@@ -47,9 +47,9 @@ Options
 
 --- 151.101.0.81 timestamped ping statistics ---
 5 packets transmitted, 5 packets received, 0% packet loss
-Round-trip    min/avg/max = 2/19.200/20 ms
-Request  (TX) min/avg/max = 2/9.400/10 ms
-Response (RX) min/avg/max = 2/9.800/10 ms
+Round-trip    min/avg/max = 18/19.200/20 ms
+Request  (TX) min/avg/max = 9/9.400/10 ms
+Response (RX) min/avg/max = 9/9.800/10 ms
 ```
 
 ```
