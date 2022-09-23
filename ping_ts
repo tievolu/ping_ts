@@ -41,7 +41,7 @@ my $latency_dl_total  = 0;
 my $minimum_rtt;
 my $offset;
 
-my $packet_id = $$;
+my $packet_id = $$ % 65536;
 my $seq;
 
 &process_args();
